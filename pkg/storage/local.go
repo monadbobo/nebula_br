@@ -7,12 +7,18 @@ import (
 )
 
 type LocalBackedStore struct {
-	dir string
-	log *zap.Logger
+	dir        string
+	backupName string
+	log        *zap.Logger
 }
 
 func NewLocalBackedStore(dir string, log *zap.Logger) *LocalBackedStore {
 	return &LocalBackedStore{dir: dir, log: log}
+}
+
+func (s *LocalBackedStore) SetBackupName(name string) {
+	s.backupName = name
+	s.dir += "/" + s.backupName
 }
 
 func (s LocalBackedStore) URI() string {
@@ -21,7 +27,6 @@ func (s LocalBackedStore) URI() string {
 
 func (s LocalBackedStore) copyCommand(src []string, dir string) string {
 	cmdFormat := "mkdir -p " + dir + " && cp -rf %s " + dir
-	//cmdFormat := "cp %s " + dir
 	files := ""
 	for _, f := range src {
 		files += f + " "
@@ -30,17 +35,45 @@ func (s LocalBackedStore) copyCommand(src []string, dir string) string {
 	return fmt.Sprintf(cmdFormat, files)
 }
 
-func (s LocalBackedStore) CopyMetaCommand(src []string) string {
+func (s *LocalBackedStore) BackupPreCommand() []string {
+	return []string{"mkdir", s.dir}
+}
+
+func (s LocalBackedStore) BackupMetaCommand(src []string) string {
 	metaDir := s.dir + "/" + "meta"
 	return s.copyCommand(src, metaDir)
 }
 
-func (s LocalBackedStore) CopyStorageCommand(src []string, prefix string) string {
-	storageDir := s.dir + "/" + "storage/" + prefix
-	return s.copyCommand(src, storageDir)
+func (s LocalBackedStore) BackupStorageCommand(src string, host string, spaceId string) string {
+	storageDir := s.dir + "/" + "storage/" + host + "/" + spaceId
+	data := src + "/data "
+	wal := src + "/wal "
+	return "mkdir -p " + storageDir + " && cp -rf " + data + wal + storageDir
 }
 
-func (s LocalBackedStore) BackupMetaFileCommand(src string) string {
-	f := "cp " + src + " " + s.dir + "/"
-	return f
+func (s LocalBackedStore) BackupMetaFileCommand(src string) []string {
+	return []string{"cp", src, s.dir}
+}
+
+func (s LocalBackedStore) RestoreMetaFileCommand(file string, dst string) []string {
+	return []string{"cp", s.dir + "/" + file, dst}
+}
+
+func (s LocalBackedStore) RestoreMetaCommand(src []string, dst string) string {
+	metaDir := s.dir + "/" + "meta/"
+	files := ""
+	for _, f := range src {
+		files += metaDir + f + " "
+	}
+	return fmt.Sprintf("cp -rf %s "+dst, files)
+}
+
+func (s LocalBackedStore) RestoreStorageCommand(host string, spaceID []string, dst string) string {
+	storageDir := s.dir + "/storage/" + host + "/"
+	dirs := ""
+	for _, id := range spaceID {
+		dirs += storageDir + id + " "
+	}
+
+	return fmt.Sprintf("cp -rf %s "+dst, dirs)
 }

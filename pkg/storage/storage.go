@@ -8,9 +8,14 @@ import (
 )
 
 type ExternalStorage interface {
-	CopyStorageCommand(src []string, prefix string) string
-	CopyMetaCommand(src []string) string
-	BackupMetaFileCommand(src string) string
+	SetBackupName(name string)
+	BackupPreCommand() []string
+	BackupStorageCommand(src string, host string, spaceID string) string
+	BackupMetaCommand(src []string) string
+	BackupMetaFileCommand(src string) []string
+	RestoreMetaFileCommand(file string, dst string) []string
+	RestoreMetaCommand(src []string, dst string) string
+	RestoreStorageCommand(host string, spaceID []string, dst string) string
 	URI() string
 }
 

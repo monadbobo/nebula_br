@@ -3,5 +3,6 @@ package cmd
 import "github.com/monadbobo/br/pkg/config"
 
 var (
-	cf config.Config
+	cf            config.BackupConfig
+	restoreConfig config.RestoreConfig
 )

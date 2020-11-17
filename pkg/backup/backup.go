@@ -2,16 +2,15 @@ package backup
 
 import (
 	"errors"
-	"io/ioutil"
-	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/facebook/fbthrift/thrift/lib/go/thrift"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/ssh"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 
@@ -21,11 +20,12 @@ import (
 	"github.com/monadbobo/br/pkg/config"
 	"github.com/monadbobo/br/pkg/nebula"
 	"github.com/monadbobo/br/pkg/nebula/meta"
+	"github.com/monadbobo/br/pkg/ssh"
 	"github.com/monadbobo/br/pkg/storage"
 )
 
 var defaultTimeout time.Duration = 120 * time.Second
-var metaFile = "/tmp/backup.meta"
+var tmpDir = "/tmp/"
 
 type BackupError struct {
 	msg string
@@ -46,13 +46,14 @@ func (e *BackupError) Error() string {
 
 type Backup struct {
 	client         *meta.MetaServiceClient
-	config         config.Config
+	config         config.BackupConfig
 	metaAddr       string
 	backendStorage storage.ExternalStorage
 	log            *zap.Logger
+	metaFileName   string
 }
 
-func NewBackupClient(cf config.Config, log *zap.Logger) *Backup {
+func NewBackupClient(cf config.BackupConfig, log *zap.Logger) *Backup {
 	backend, err := storage.NewExternalStorage(cf.BackendUrl, log)
 	if err != nil {
 		log.Error("new external storage failed", zap.Error(err))
@@ -142,7 +143,9 @@ func (b *Backup) CreateBackup(count int) (*meta.CreateBackupResp, error) {
 }
 
 func (b *Backup) writeMetadata(meta *meta.BackupMeta) error {
-	file, err := os.OpenFile(metaFile, os.O_TRUNC|os.O_CREATE|os.O_RDWR, 0644)
+	b.metaFileName = tmpDir + meta.BackupName + ".meta"
+
+	file, err := os.OpenFile(b.metaFileName, os.O_TRUNC|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
@@ -153,12 +156,17 @@ func (b *Backup) writeMetadata(meta *meta.BackupMeta) error {
 
 	binaryOut := thrift.NewBinaryProtocol(trans, false, true)
 	defer trans.Close()
+	var absMetaFiles []string
+	for _, files := range meta.MetaFiles {
+		f := filepath.Base(files)
+		absMetaFiles = append(absMetaFiles, f)
+	}
+	meta.MetaFiles = absMetaFiles
 	err = meta.Write(binaryOut)
 	if err != nil {
 		return err
 	}
 	binaryOut.Flush()
-
 	return nil
 }
 
@@ -179,89 +187,56 @@ func (b *Backup) BackupCluster() error {
 	return nil
 }
 
-func (b *Backup) newSshSession(addr string, user string) (*ssh.Session, error) {
-	key, err := ioutil.ReadFile(os.Getenv("HOME") + "/.ssh/id_rsa")
-	if err != nil {
-		b.log.Error("unable to read private key", zap.Error(err))
-		return nil, err
-	}
-
-	// Create the Signer for this private key.
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		b.log.Error("unable to parse private key", zap.Error(err))
-		return nil, err
-	}
-	config := &ssh.ClientConfig{
-		User:            user,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-	}
-
-	client, err := ssh.Dial("tcp", net.JoinHostPort(addr, "22"), config)
-	if err != nil {
-		b.log.Error("unable to connect host", zap.Error(err), zap.String("host", addr), zap.String("user", user))
-		return nil, err
-	}
-
-	session, err := client.NewSession()
-	if err != nil {
-		b.log.Error("new session failed", zap.Error(err))
-		return nil, err
-	}
-
-	return session, nil
-}
-
-func (b *Backup) uploadBySSH(addr string, user string, cmd string) error {
-	session, err := b.newSshSession(addr, user)
-	if err != nil {
-		return err
-	}
-	defer session.Close()
-	b.log.Info("ssh will exec", zap.String("cmd", cmd))
-
-	err = session.Run(cmd)
-	if err != nil {
-		b.log.Error("ssh run failed", zap.Error(err))
-		return err
-	}
-	return nil
-}
-
 func (b *Backup) uploadMeta(g *errgroup.Group, files []string) {
 
 	b.log.Info("will upload meta", zap.Int("sst file count", len(files)))
-	cmd := b.backendStorage.CopyMetaCommand(files)
+	cmd := b.backendStorage.BackupMetaCommand(files)
 	b.log.Info("start upload meta", zap.String("addr", b.metaAddr))
 	ipAddr := strings.Split(b.metaAddr, ":")
-	g.Go(func() error { return b.uploadBySSH(ipAddr[0], b.config.MetaUser, cmd) })
+	g.Go(func() error { return ssh.ExecCommandBySSH(ipAddr[0], b.config.MetaUser, cmd, b.log) })
 }
 
 func (b *Backup) uploadStorage(g *errgroup.Group, dirs map[string][]spaceInfo) {
 	for k, v := range dirs {
 		b.log.Info("start upload storage", zap.String("addr", k))
-
-		var cpDir []string
+		idMap := make(map[string]string)
 		for _, info := range v {
-			cpDir = append(cpDir, info.checkpointDir)
+			idStr := strconv.FormatInt(int64(info.spaceID), 10)
+			idMap[idStr] = info.checkpointDir
 		}
 
 		ipAddrs := strings.Split(k, ":")
-		cmd := b.backendStorage.CopyStorageCommand(cpDir, ipAddrs[0])
+		for id2, cp := range idMap {
+			cmd := b.backendStorage.BackupStorageCommand(cp, ipAddrs[0], id2)
 
-		g.Go(func() error { return b.uploadBySSH(ipAddrs[0], b.config.StorageUser, cmd) })
+			g.Go(func() error { return ssh.ExecCommandBySSH(ipAddrs[0], b.config.StorageUser, cmd, b.log) })
+		}
 	}
 }
 
 func (b *Backup) uploadMetaFile() error {
-	cmdStr := b.backendStorage.BackupMetaFileCommand(metaFile)
+	cmdStr := b.backendStorage.BackupMetaFileCommand(b.metaFileName)
 
-	cmd := exec.Command(cmdStr)
+	cmd := exec.Command(cmdStr[0], cmdStr[1:]...)
 	err := cmd.Run()
 	if err != nil {
 		return err
 	}
+	cmd.Wait()
+
+	return nil
+}
+
+func (b *Backup) execPreCommand(backupName string) error {
+	b.backendStorage.SetBackupName(backupName)
+	cmdStr := b.backendStorage.BackupPreCommand()
+
+	cmd := exec.Command(cmdStr[0], cmdStr[1:]...)
+	err := cmd.Run()
+	if err != nil {
+		return err
+	}
+	cmd.Wait()
 
 	return nil
 }
@@ -270,32 +245,39 @@ func (b *Backup) UploadAll(meta *meta.BackupMeta) error {
 	//upload meta
 	g, _ := errgroup.WithContext(context.Background())
 
+	err := b.execPreCommand(meta.GetBackupName())
+	if err != nil {
+		return err
+	}
+
 	b.uploadMeta(g, meta.GetMetaFiles())
 	//upload storage
 	storageMap := make(map[string][]spaceInfo)
 	for k, v := range meta.GetBackupInfo() {
-		for _, f := range v.GetBackupName() {
+		for _, f := range v.GetCpDirs() {
 			cpDir := spaceInfo{k, string(f.CheckpointDir)}
 			storageMap[hostaddrToString(f.Host)] = append(storageMap[hostaddrToString(f.Host)], cpDir)
 		}
 	}
 	b.uploadStorage(g, storageMap)
-	// write the meta for this backup to local
-	g.Go(func() error {
-		err := b.writeMetadata(meta)
-		if err != nil {
-			b.log.Error("write the meta file failed", zap.Error(err))
-			return err
-		}
-		b.log.Info("write meta data finished")
-		// upload meta file
-		b.uploadMetaFile()
-		return nil
-	})
 
-	err := g.Wait()
+	err = g.Wait()
 	if err != nil {
 		b.log.Error("upload error")
+		return err
+	}
+	// write the meta for this backup to local
+
+	err = b.writeMetadata(meta)
+	if err != nil {
+		b.log.Error("write the meta file failed", zap.Error(err))
+		return err
+	}
+	b.log.Info("write meta data finished")
+	// upload meta file
+	err = b.uploadMetaFile()
+	if err != nil {
+		b.log.Error("upload meta file failed", zap.Error(err))
 		return err
 	}
 
